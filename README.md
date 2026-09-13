@@ -127,3 +127,17 @@ La aplicación funciona localmente y no utiliza base de datos, APIs externas ni 
 - Si el archivo de origen trae valores acumulados y movimientos individuales mezclados sin un campo que los diferencie, la aplicación no puede inferir con certeza cuál debe prevalecer; esa situación debe revisarse en calidad de datos antes de usar el total.
 - El cruce operativo usa obligación como llave principal. La cédula se usa para aplicar la regla de exclusión de todo el cliente cuando alguna de sus obligaciones registra pago; no se realiza un `merge` muchos-a-muchos.
 - La asignación proporcional es aproximada porque una obligación no se divide entre gestores.
+
+### Corrección aplicada con archivos reales de agosto de 2026
+
+Se revisaron los archivos `FINESA_RECAUDO_01SEP2026.xlsx` y `Asignacion_202608.xlsx`.
+
+Hallazgos incorporados en esta versión:
+- El archivo de recaudo se llama `01SEP2026`, pero sus pagos están fechados entre el 1 y el 31 de agosto de 2026. La aplicación ahora detecta los períodos presentes y permite escoger explícitamente cuál contabilizar. Si no coincide con la configuración mensual, muestra una advertencia clara en vez de presentar un recaudo de cero sin explicación.
+- La clasificación real del recaudo usa `ESTADO_OBLIG`, cuyos valores `CAST` y `VENC` ya se reconocen como Castigada y Vencida.
+- En la hoja `Base`, la columna `MARCA_CASTIGO` contiene realmente ambos valores, `CAST` y `VENC`. Debe seleccionarse como Tipo de cartera. La columna `FILTRO VENCIDA` está vacía en el archivo revisado.
+- La hoja `Base` tiene un rango usado de Excel extendido hasta miles de columnas vacías. La lectura ahora limita las columnas útiles para reducir memoria y evitar errores al procesar o asignar.
+- La distribución valida gestores, prioridades, pesos y saldos; normaliza los pesos como protección y evita operaciones problemáticas con valores nulos de pandas.
+- Los errores de asignación ahora se presentan como mensajes comprensibles dentro de Streamlit.
+
+Con los archivos revisados, el recaudo reconocido para agosto de 2026 es $379.347.628,79: $224.300.333,01 de cartera Castigada y $155.047.295,78 de cartera Vencida, antes de comparar contra las metas ingresadas por el usuario.

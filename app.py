@@ -38,7 +38,7 @@ def init_state() -> None:
         "meta_castigada": 0.0, "meta_vencida": 0.0,
         "gestores": pd.DataFrame(columns=["Gestor", "Prioridad", "Peso (%)", "Activo"]),
         "recaudo_limpio": None, "pagos_obligaciones": set(), "pagos_cedulas": set(),
-        "resumen_metas": None, "fecha_corte": None, "calidad_recaudo": [],
+        "resumen_metas": None, "fecha_corte": None, "periodo_recaudo": None, "calidad_recaudo": [],
         "asignacion_limpia": None, "resultado_asignacion": None,
     }
     for k, v in defaults.items():
@@ -84,6 +84,49 @@ def limpiar_monetario(serie: pd.Series) -> pd.Series:
             s = s.replace(",", ".") if len(tail) <= 2 else s.replace(",", "")
         return s
     return pd.to_numeric(serie.map(one), errors="coerce")
+
+
+def convertir_fechas(serie: pd.Series) -> pd.Series:
+    """Convierte fechas reales, texto, seriales de Excel y números DDMMAAAA."""
+    def one(value):
+        if pd.isna(value):
+            return pd.NaT
+        if isinstance(value, (pd.Timestamp, datetime, date)):
+            return pd.Timestamp(value)
+
+        raw = str(value).strip()
+        if not raw:
+            return pd.NaT
+        raw = re.sub(r"\.0$", "", raw)
+        digits = re.sub(r"\D", "", raw)
+
+        # Algunos archivos exportan 1-9 de cada mes sin el cero inicial:
+        # 1092026 = 01/09/2026. También se admite AAAAMMDD.
+        if raw.isdigit() or re.fullmatch(r"\d+\.0", str(value).strip()):
+            if len(digits) == 7:
+                digits = "0" + digits
+            if len(digits) == 8:
+                year_first = int(digits[:4])
+                fmt = "%Y%m%d" if 1900 <= year_first <= 2100 else "%d%m%Y"
+                parsed = pd.to_datetime(digits, format=fmt, errors="coerce")
+                if not pd.isna(parsed):
+                    return parsed
+            # Serial de fecha de Excel (sistema 1900).
+            try:
+                serial = float(raw)
+                if 1 <= serial <= 100000:
+                    return pd.Timestamp("1899-12-30") + pd.to_timedelta(serial, unit="D")
+            except (TypeError, ValueError, OverflowError):
+                pass
+
+        return pd.to_datetime(raw, errors="coerce", dayfirst=True)
+
+    return pd.to_datetime(serie.map(one), errors="coerce")
+
+
+def periodos_disponibles(serie: pd.Series) -> list[tuple[int, int]]:
+    fechas = convertir_fechas(serie).dropna()
+    return sorted({(int(v.year), int(v.month)) for v in fechas})
 
 
 def clasificar_cartera(serie: pd.Series) -> pd.Series:
@@ -175,7 +218,7 @@ def procesar_recaudo(df, mapeo, anio, mes):
         "Cedula": normalizar_id(df[mapeo["cedula"]]),
         "Tipo_original": df[mapeo["tipo"]].astype("string"),
         "Recaudo": limpiar_monetario(df[mapeo["recaudo"]]),
-        "Fecha_pago": pd.to_datetime(df[mapeo["fecha_pago"]], errors="coerce", dayfirst=True),
+        "Fecha_pago": convertir_fechas(df[mapeo["fecha_pago"]]),
     })
     x["Tipo_cartera"]=clasificar_cartera(x["Tipo_original"])
     calidad=[]
@@ -184,6 +227,8 @@ def procesar_recaudo(df, mapeo, anio, mes):
     calidad.append(("Recaudo no numérico", int(x.Recaudo.isna().sum()), "Valores que no pudieron convertirse"))
     calidad.append(("Fecha inválida", int(x.Fecha_pago.isna().sum()), "Fechas que no pudieron convertirse"))
     calidad.append(("Cartera sin clasificar", int((x.Tipo_cartera=="Sin clasificar").sum()), "Valores distintos de Castigada/Vencida"))
+    fuera_periodo=x.Fecha_pago.notna()&((x.Fecha_pago.dt.year!=anio)|(x.Fecha_pago.dt.month!=mes))
+    calidad.append(("Registros fuera del período seleccionado", int(fuera_periodo.sum()), f"No se suman en {MESES[mes]} {anio}"))
     valid=x[(x.Fecha_pago.dt.year==anio)&(x.Fecha_pago.dt.month==mes)&x.Recaudo.notna()&(x.Recaudo>0)&(x.Obligacion!="")].copy()
     # Elimina filas idénticas. Si existen múltiples movimientos legítimos por obligación/fecha/valor, conserva uno por combinación exacta.
     dup=valid.duplicated(subset=["Obligacion","Cedula","Tipo_cartera","Recaudo","Fecha_pago"], keep="first")
@@ -372,18 +417,53 @@ def pantalla_recaudo():
     with st.form("map_recaudo"):
         st.subheader("Mapeo de columnas")
         m={k:selector_columna(lbl,cols,detectar_columna(cols,k),key=f"rec_{k}") for k,lbl in [("obligacion","Número de obligación"),("cedula","Cédula"),("tipo","Tipo de cartera"),("recaudo","Valor del recaudo"),("fecha_pago","Fecha del pago")]}
+        periodos=periodos_disponibles(df[m["fecha_pago"]])
+        configurado=(int(st.session_state.anio),int(st.session_state.mes))
+        if periodos:
+            periodo_default=configurado if configurado in periodos else periodos[-1]
+            periodo=st.selectbox(
+                "Período de recaudo a contabilizar",
+                periodos,
+                index=periodos.index(periodo_default),
+                format_func=lambda p:f"{MESES[p[1]]} {p[0]}",
+            )
+            if configurado not in periodos:
+                st.warning(
+                    f"El archivo no contiene pagos de {MESES[configurado[1]]} {configurado[0]}. "
+                    f"Se seleccionó automáticamente {MESES[periodo[1]]} {periodo[0]}. "
+                    "Verifique que las metas ingresadas correspondan a ese período."
+                )
+        else:
+            periodo=configurado
+            st.error("No se reconocieron fechas válidas en la columna seleccionada.")
         go=st.form_submit_button("Procesar recaudo",type="primary")
     if go:
+        if not periodos:
+            st.error("Corrija el mapeo de la fecha de pago antes de procesar."); return
         with st.spinner("Procesando y validando recaudo..."):
-            limpio,cal=procesar_recaudo(df,m,st.session_state.anio,st.session_state.mes)
-            res=resumen_recaudo(limpio,st.session_state.meta_castigada,st.session_state.meta_vencida,corte)
-            st.session_state.recaudo_limpio=limpio; st.session_state.pagos_obligaciones=set(limpio.Obligacion); st.session_state.pagos_cedulas=set(limpio.Cedula)-{""}; st.session_state.resumen_metas=res; st.session_state.fecha_corte=corte; st.session_state.calidad_recaudo=cal
+            anio_rec,mes_rec=periodo
+            limpio,cal=procesar_recaudo(df,m,anio_rec,mes_rec)
+            fechas_periodo=convertir_fechas(df[m["fecha_pago"]])
+            fechas_periodo=fechas_periodo[(fechas_periodo.dt.year==anio_rec)&(fechas_periodo.dt.month==mes_rec)]
+            if corte.year==anio_rec and corte.month==mes_rec:
+                corte_calculo=corte
+            elif not fechas_periodo.empty:
+                corte_calculo=fechas_periodo.max().date()
+                st.info(
+                    f"La fecha del nombre del archivo no pertenece al período contabilizado. "
+                    f"Para los indicadores diarios se usa {corte_calculo:%d/%m/%Y}, última fecha de pago válida."
+                )
+            else:
+                corte_calculo=date(anio_rec,mes_rec,calendar.monthrange(anio_rec,mes_rec)[1])
+            res=resumen_recaudo(limpio,st.session_state.meta_castigada,st.session_state.meta_vencida,corte_calculo)
+            st.session_state.recaudo_limpio=limpio; st.session_state.pagos_obligaciones=set(limpio.Obligacion); st.session_state.pagos_cedulas=set(limpio.Cedula)-{""}; st.session_state.resumen_metas=res; st.session_state.fecha_corte=corte_calculo; st.session_state.periodo_recaudo=periodo; st.session_state.calidad_recaudo=cal
     if st.session_state.resumen_metas is None: return
     res=st.session_state.resumen_metas; rec=float(res["Recaudo acumulado"].sum()); meta=float(res.Meta.sum()); cump=rec/meta if meta else 0
-    ultimo=calendar.monthrange(st.session_state.anio,st.session_state.mes)[1]
+    anio_rec,mes_rec=st.session_state.periodo_recaudo or (st.session_state.anio,st.session_state.mes)
+    ultimo=calendar.monthrange(anio_rec,mes_rec)[1]
     dias_trans=min(st.session_state.fecha_corte.day,ultimo); dias_rest=max(ultimo-dias_trans,0); prom=rec/max(dias_trans,1); requerido=max(meta-rec,0)/max(dias_rest,1) if dias_rest else max(meta-rec,0)
     c=st.columns(5); c[0].metric("Meta consolidada",formato_pesos(meta)); c[1].metric("Recaudo",formato_pesos(rec)); c[2].metric("Cumplimiento",f"{cump:.1%}"); c[3].metric("Promedio diario",formato_pesos(prom)); c[4].metric("Recaudo diario requerido",formato_pesos(requerido))
-    st.caption(f"Días transcurridos: {dias_trans} · Días restantes: {dias_rest}")
+    st.caption(f"Período contabilizado: {MESES[mes_rec]} {anio_rec} · Días transcurridos: {dias_trans} · Días restantes: {dias_rest}")
     show=res.copy(); show["Meta"]=show.Meta.map(formato_pesos); show["Recaudo acumulado"]=show["Recaudo acumulado"].map(formato_pesos); show["Brecha pendiente"]=show["Brecha pendiente"].map(formato_pesos); show["Cumplimiento"]=show.Cumplimiento.map(lambda x:f"{x:.1%}")
     st.dataframe(show,use_container_width=True,hide_index=True)
     sem="🟢 Verde" if cump>=.9 else "🟡 Amarillo" if cump>=.7 else "🔴 Rojo"; st.markdown(f"**Semáforo consolidado:** {sem}")
